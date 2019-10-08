@@ -17,7 +17,7 @@ namespace ENode.EQueue
         private SendReplyService _sendReplyService;
         private IJsonSerializer _jsonSerializer;
         private IEventSerializer _eventSerializer;
-        private IMessageProcessor<ProcessingDomainEventStreamMessage, DomainEventStreamMessage> _messageProcessor;
+        private IProcessingEventProcessor _messageProcessor;
         private ILogger _logger;
         private bool _sendEventHandledMessage;
 
@@ -28,7 +28,7 @@ namespace ENode.EQueue
             _sendReplyService = new SendReplyService("EventConsumerSendReplyService");
             _jsonSerializer = ObjectContainer.Resolve<IJsonSerializer>();
             _eventSerializer = ObjectContainer.Resolve<IEventSerializer>();
-            _messageProcessor = ObjectContainer.Resolve<IMessageProcessor<ProcessingDomainEventStreamMessage, DomainEventStreamMessage>>();
+            _messageProcessor = ObjectContainer.Resolve<IProcessingEventProcessor>();
             _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(GetType().FullName);
             _sendEventHandledMessage = sendEventHandledMessage;
             return this;
@@ -70,8 +70,8 @@ namespace ENode.EQueue
             var message = _jsonSerializer.Deserialize<EventStreamMessage>(Encoding.UTF8.GetString(queueMessage.Body));
             var domainEventStreamMessage = ConvertToDomainEventStream(message);
             var processContext = new DomainEventStreamProcessContext(this, domainEventStreamMessage, queueMessage, context);
-            var processingMessage = new ProcessingDomainEventStreamMessage(domainEventStreamMessage, processContext);
-            _logger.InfoFormat("ENode event message received, messageId: {0}, aggregateRootId: {1}, aggregateRootType: {2}, version: {3}", domainEventStreamMessage.Id, domainEventStreamMessage.AggregateRootStringId, domainEventStreamMessage.AggregateRootTypeName, domainEventStreamMessage.Version);
+            var processingMessage = new ProcessingEvent(domainEventStreamMessage, processContext);
+            _logger.DebugFormat("ENode event stream message received, messageId: {0}, aggregateRootId: {1}, aggregateRootType: {2}, version: {3}", domainEventStreamMessage.Id, domainEventStreamMessage.AggregateRootId, domainEventStreamMessage.AggregateRootTypeName, domainEventStreamMessage.Version);
             _messageProcessor.Process(processingMessage);
         }
 
@@ -91,21 +91,24 @@ namespace ENode.EQueue
             return domainEventStreamMessage;
         }
 
-        class DomainEventStreamProcessContext : EQueueProcessContext
+        class DomainEventStreamProcessContext : IEventProcessContext
         {
+            private readonly QueueMessage _queueMessage;
+            private readonly IMessageContext _messageContext;
             private readonly DomainEventConsumer _eventConsumer;
             private readonly DomainEventStreamMessage _domainEventStreamMessage;
 
             public DomainEventStreamProcessContext(DomainEventConsumer eventConsumer, DomainEventStreamMessage domainEventStreamMessage, QueueMessage queueMessage, IMessageContext messageContext)
-                : base(queueMessage, messageContext)
             {
+                _queueMessage = queueMessage;
+                _messageContext = messageContext;
                 _eventConsumer = eventConsumer;
                 _domainEventStreamMessage = domainEventStreamMessage;
             }
 
-            public override void NotifyMessageProcessed()
+            public void NotifyEventProcessed()
             {
-                base.NotifyMessageProcessed();
+                _messageContext.OnMessageHandled(_queueMessage);
 
                 if (!_eventConsumer._sendEventHandledMessage)
                 {

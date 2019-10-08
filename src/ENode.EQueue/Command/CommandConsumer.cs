@@ -9,6 +9,7 @@ using ECommon.Serializing;
 using ENode.Commanding;
 using ENode.Domain;
 using ENode.Infrastructure;
+using ENode.Messaging;
 using EQueue.Clients.Consumers;
 using EQueue.Protocols;
 using IQueueMessageHandler = EQueue.Clients.Consumers.IMessageHandler;
@@ -75,12 +76,13 @@ namespace ENode.EQueue
             var command = _jsonSerializer.Deserialize(commandMessage.CommandData, commandType) as ICommand;
             var commandExecuteContext = new CommandExecuteContext(_repository, _aggregateStorage, queueMessage, context, commandMessage, _sendReplyService);
             commandItems["CommandReplyAddress"] = commandMessage.ReplyAddress;
-            _logger.InfoFormat("ENode command message received, messageId: {0}, aggregateRootId: {1}", command.Id, command.AggregateRootId);
+            _logger.DebugFormat("ENode command message received, messageId: {0}, aggregateRootId: {1}", command.Id, command.AggregateRootId);
             _commandProcessor.Process(new ProcessingCommand(command, commandExecuteContext, commandItems));
         }
 
         class CommandExecuteContext : ICommandExecuteContext
         {
+            private IApplicationMessage _applicationMessage;
             private string _result;
             private readonly ConcurrentDictionary<string, IAggregateRoot> _trackingAggregateRootDict;
             private readonly IRepository _repository;
@@ -143,11 +145,11 @@ namespace ENode.EQueue
 
                 if (firstFromCache)
                 {
-                    aggregateRoot = await _repository.GetAsync<T>(id);
+                    aggregateRoot = await _repository.GetAsync<T>(id).ConfigureAwait(false);
                 }
                 else
                 {
-                    aggregateRoot = await _aggregateRootStorage.GetAsync(typeof(T), aggregateRootId);
+                    aggregateRoot = await _aggregateRootStorage.GetAsync(typeof(T), aggregateRootId).ConfigureAwait(false);
                 }
 
                 if (aggregateRoot != null)
@@ -174,6 +176,16 @@ namespace ENode.EQueue
             public string GetResult()
             {
                 return _result;
+            }
+
+            public void SetApplicationMessage(IApplicationMessage applicationMessage)
+            {
+                _applicationMessage = applicationMessage;
+            }
+
+            public IApplicationMessage GetApplicationMessage()
+            {
+                return _applicationMessage;
             }
         }
     }

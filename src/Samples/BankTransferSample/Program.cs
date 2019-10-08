@@ -76,17 +76,35 @@ namespace BankTransferSample
             Console.WriteLine(string.Empty);
 
             //账户1向账户3转账300元，交易会失败，因为账户3不存在
-            commandService.SendAsync(new StartTransferTransactionCommand(ObjectId.GenerateNewStringId(), new TransferTransactionInfo(account1, account3, 300D))).Wait();
+            commandService.SendAsync(new StartTransferTransactionCommand(ObjectId.GenerateNewStringId(), new TransferTransactionInfo(account1, account3, 300D))
+            {
+                Items = new Dictionary<string, string>
+                {
+                    { "ProcessId", "10000" }
+                }
+            }).Wait();
             syncHelper.WaitOne();
             Console.WriteLine(string.Empty);
 
             //账户1向账户2转账1200元，交易会失败，因为余额不足
-            commandService.SendAsync(new StartTransferTransactionCommand(ObjectId.GenerateNewStringId(), new TransferTransactionInfo(account1, account2, 1200D))).Wait();
+            commandService.SendAsync(new StartTransferTransactionCommand(ObjectId.GenerateNewStringId(), new TransferTransactionInfo(account1, account2, 1200D))
+            {
+                Items = new Dictionary<string, string>
+                {
+                    { "ProcessId", "10001" }
+                }
+            }).Wait();
             syncHelper.WaitOne();
             Console.WriteLine(string.Empty);
 
             //账户2向账户1转账500元，交易成功
-            commandService.SendAsync(new StartTransferTransactionCommand(ObjectId.GenerateNewStringId(), new TransferTransactionInfo(account2, account1, 500D))).Wait();
+            commandService.SendAsync(new StartTransferTransactionCommand(ObjectId.GenerateNewStringId(), new TransferTransactionInfo(account2, account1, 500D))
+            {
+                Items = new Dictionary<string, string>
+                {
+                    { "ProcessId", "10002" }
+                }
+            }).Wait();
             syncHelper.WaitOne();
 
             Thread.Sleep(200);
@@ -129,8 +147,8 @@ namespace BankTransferSample
             var accountList = new List<string>();
             var accountCount = 100;
             var transactionCount = 1000;
-            var depositAmount = 1000000D;
-            var transferAmount = 1000D;
+            var depositAmount = 1000000000D;
+            var transferAmount = 100D;
 
             //创建银行账户
             for (var i = 0; i < accountCount; i++)
@@ -151,7 +169,7 @@ namespace BankTransferSample
 
             Console.WriteLine(string.Empty);
 
-            countSyncHelper.SetExpectedCount((int)transactionCount);
+            countSyncHelper.SetExpectedCount(transactionCount);
 
             var watch = Stopwatch.StartNew();
             for (var i = 0; i < transactionCount; i++)

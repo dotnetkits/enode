@@ -4,6 +4,7 @@ using ECommon.Components;
 using ECommon.IO;
 using ECommon.Serializing;
 using ENode.Infrastructure;
+using ENode.Messaging;
 using EQueue.Clients.Producers;
 using EQueueMessage = EQueue.Protocols.Message;
 
@@ -46,7 +47,7 @@ namespace ENode.EQueue
         public Task<AsyncTaskResult> PublishAsync(IApplicationMessage message)
         {
             var queueMessage = CreateEQueueMessage(message);
-            return _sendMessageService.SendMessageAsync(Producer, queueMessage, message.GetRoutingKey() ?? message.Id, message.Id, null);
+            return _sendMessageService.SendMessageAsync(Producer, "applicationMessage", message.GetType().Name, queueMessage, message.Id, message.Id, message.Items);
         }
 
         private EQueueMessage CreateEQueueMessage(IApplicationMessage message)

@@ -14,6 +14,8 @@ using ENode.Commanding;
 using ENode.Configurations;
 using ENode.Domain;
 using ENode.Eventing;
+using ENode.Infrastructure;
+using ENode.Messaging;
 using NoteSample.Commands;
 using ECommonConfiguration = ECommon.Configurations.Configuration;
 
@@ -27,7 +29,7 @@ namespace ENode.CommandProcessorPerfTests
         static Stopwatch _watch;
         static IRepository _repository;
         static ICommandProcessor _commandProcessor;
-        static IEventService _eventService;
+        static IEventCommittingService _eventService;
         static int _commandCount;
         static int _executedCount;
         static int _totalCommandCount;
@@ -104,7 +106,7 @@ namespace ENode.CommandProcessorPerfTests
                 .RegisterBusinessComponents(assemblies)
                 .BuildContainer()
                 .InitializeBusinessAssemblies(assemblies);
-            _eventService = ObjectContainer.Resolve<IEventService>();
+            _eventService = ObjectContainer.Resolve<IEventCommittingService>();
 
             _logger = ObjectContainer.Resolve<ILoggerFactory>().Create("main");
             _repository = ObjectContainer.Resolve<IRepository>();
@@ -118,6 +120,7 @@ namespace ENode.CommandProcessorPerfTests
             private readonly ConcurrentDictionary<string, IAggregateRoot> _aggregateRoots;
             private readonly int _printSize;
             private string _result;
+            private IApplicationMessage _applicationMessage;
 
             public CommandExecuteContext(int commandCount)
             {
@@ -198,6 +201,16 @@ namespace ENode.CommandProcessorPerfTests
             public string GetResult()
             {
                 return _result;
+            }
+
+            public void SetApplicationMessage(IApplicationMessage applicationMessage)
+            {
+                _applicationMessage = applicationMessage;
+            }
+
+            public IApplicationMessage GetApplicationMessage()
+            {
+                return _applicationMessage;
             }
         }
     }

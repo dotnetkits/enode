@@ -12,6 +12,7 @@ namespace ENode.Domain.Impl
 {
     public class DefaultMemoryCache : IMemoryCache
     {
+        private object _lockObj = new object();
         private readonly ConcurrentDictionary<string, AggregateCacheInfo> _aggregateRootInfoDict;
         private readonly IAggregateStorage _aggregateStorage;
         private readonly ITypeNameProvider _typeNameProvider;
@@ -34,6 +35,8 @@ namespace ENode.Domain.Impl
         public async Task<IAggregateRoot> GetAsync(object aggregateRootId, Type aggregateRootType)
         {
             if (aggregateRootId == null) throw new ArgumentNullException("aggregateRootId");
+            if (aggregateRootType == null) throw new ArgumentNullException("aggregateRootType");
+
             if (_aggregateRootInfoDict.TryGetValue(aggregateRootId.ToString(), out AggregateCacheInfo aggregateRootInfo))
             {
                 var aggregateRoot = aggregateRootInfo.AggregateRoot;
@@ -43,10 +46,10 @@ namespace ENode.Domain.Impl
                 }
                 if (aggregateRoot.GetChanges().Count() > 0)
                 {
-                    var lastestAggregateRoot = await _aggregateStorage.GetAsync(aggregateRootType, aggregateRootId.ToString());
+                    var lastestAggregateRoot = await _aggregateStorage.GetAsync(aggregateRootType, aggregateRootId.ToString()).ConfigureAwait(false);
                     if (lastestAggregateRoot != null)
                     {
-                        SetInternal(lastestAggregateRoot);
+                        ResetAggregateRootCache(lastestAggregateRoot);
                     }
                     return lastestAggregateRoot;
                 }
@@ -56,31 +59,43 @@ namespace ENode.Domain.Impl
         }
         public async Task<T> GetAsync<T>(object aggregateRootId) where T : class, IAggregateRoot
         {
-            return await GetAsync(aggregateRootId, typeof(T)) as T;
+            return await GetAsync(aggregateRootId, typeof(T)).ConfigureAwait(false) as T;
         }
-        public void Set(IAggregateRoot aggregateRoot)
+        public Task UpdateAggregateRootCache(IAggregateRoot aggregateRoot)
         {
-            SetInternal(aggregateRoot);
+            ResetAggregateRootCache(aggregateRoot);
+            return Task.CompletedTask;
         }
-        public async Task RefreshAggregateFromEventStoreAsync(string aggregateRootTypeName, string aggregateRootId)
+        public Task<IAggregateRoot> RefreshAggregateFromEventStoreAsync(string aggregateRootTypeName, object aggregateRootId)
         {
+            if (aggregateRootTypeName == null) throw new ArgumentNullException("aggregateRootTypeName");
+
+            var aggregateRootType = _typeNameProvider.GetType(aggregateRootTypeName);
+            if (aggregateRootType == null)
+            {
+                _logger.ErrorFormat("Could not find aggregate root type by aggregate root type name [{0}].", aggregateRootTypeName);
+                return null;
+            }
+            return RefreshAggregateFromEventStoreAsync(aggregateRootType, aggregateRootId);
+        }
+        public async Task<IAggregateRoot> RefreshAggregateFromEventStoreAsync(Type aggregateRootType, object aggregateRootId)
+        {
+            if (aggregateRootId == null) throw new ArgumentNullException("aggregateRootId");
+            if (aggregateRootType == null) throw new ArgumentNullException("aggregateRootType");
+
             try
             {
-                var aggregateRootType = _typeNameProvider.GetType(aggregateRootTypeName);
-                if (aggregateRootType == null)
-                {
-                    _logger.ErrorFormat("Could not find aggregate root type by aggregate root type name [{0}].", aggregateRootTypeName);
-                    return;
-                }
-                var aggregateRoot = await _aggregateStorage.GetAsync(aggregateRootType, aggregateRootId);
+                var aggregateRoot = await _aggregateStorage.GetAsync(aggregateRootType, aggregateRootId.ToString()).ConfigureAwait(false);
                 if (aggregateRoot != null)
                 {
-                    SetInternal(aggregateRoot);
+                    ResetAggregateRootCache(aggregateRoot);
                 }
+                return aggregateRoot;
             }
             catch (Exception ex)
             {
-                _logger.Error(string.Format("Refresh aggregate from event store has unknown exception, aggregateRootTypeName:{0}, aggregateRootId:{1}", aggregateRootTypeName, aggregateRootId), ex);
+                _logger.Error(string.Format("Refresh aggregate from event store has unknown exception, aggregateRootTypeName:{0}, aggregateRootId:{1}", _typeNameProvider.GetTypeName(aggregateRootType), aggregateRootId), ex);
+                return null;
             }
         }
         public void Start()
@@ -92,29 +107,27 @@ namespace ENode.Domain.Impl
             _scheduleService.StopTask(_taskName);
         }
 
-        private void SetInternal(IAggregateRoot aggregateRoot)
+        private void ResetAggregateRootCache(IAggregateRoot aggregateRoot)
         {
-            if (aggregateRoot == null)
+            lock (_lockObj)
             {
-                throw new ArgumentNullException("aggregateRoot");
+                if (aggregateRoot == null)
+                {
+                    throw new ArgumentNullException("aggregateRoot");
+                }
+                _aggregateRootInfoDict.AddOrUpdate(aggregateRoot.UniqueId, x =>
+                {
+                    _logger.DebugFormat("Aggregate root in-memory cache init, aggregateRootType: {0}, aggregateRootId: {1}, aggregateRootVersion: {2}", aggregateRoot.GetType().FullName, aggregateRoot.UniqueId, aggregateRoot.Version);
+                    return new AggregateCacheInfo(aggregateRoot);
+                }, (x, existing) =>
+                {
+                    var aggregateRootOldVersion = existing.AggregateRoot.Version;
+                    existing.AggregateRoot = aggregateRoot;
+                    existing.LastUpdateTime = DateTime.Now;
+                    _logger.DebugFormat("Aggregate root in-memory cache reset, aggregateRootType: {0}, aggregateRootId: {1}, aggregateRootNewVersion: {2}, aggregateRootOldVersion: {3}", aggregateRoot.GetType().FullName, aggregateRoot.UniqueId, aggregateRoot.Version, aggregateRootOldVersion);
+                    return existing;
+                });
             }
-            _aggregateRootInfoDict.AddOrUpdate(aggregateRoot.UniqueId, x =>
-            {
-                if (_logger.IsDebugEnabled)
-                {
-                    _logger.DebugFormat("In memory aggregate added, type: {0}, id: {1}, version: {2}", aggregateRoot.GetType().FullName, aggregateRoot.UniqueId, aggregateRoot.Version);
-                }
-                return new AggregateCacheInfo(aggregateRoot);
-            }, (x, existing) =>
-            {
-                existing.AggregateRoot = aggregateRoot;
-                existing.LastUpdateTime = DateTime.Now;
-                if (_logger.IsDebugEnabled)
-                {
-                    _logger.DebugFormat("In memory aggregate updated, type: {0}, id: {1}, version: {2}", aggregateRoot.GetType().FullName, aggregateRoot.UniqueId, aggregateRoot.Version);
-                }
-                return existing;
-            });
         }
         private void CleanInactiveAggregateRoot()
         {
