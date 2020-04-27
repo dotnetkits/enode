@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using ECommon.Components;
 using ECommon.Configurations;
+using ECommon.Serilog;
 using ECommon.Utilities;
 using ENode.Configurations;
 using ENode.Eventing;
@@ -95,12 +96,12 @@ namespace ENode.EventStorePerfTests
         {
             var result = await context.EventStore.BatchAppendAsync(context.EventList);
 
-            if (result.Data.DuplicateEventAggregateRootIdList.Count > 0)
+            if (result.DuplicateEventAggregateRootIdList.Count > 0)
             {
                 Console.WriteLine("duplicated event stream.");
                 return;
             }
-            else if (result.Data.DuplicateCommandIdList.Count > 0)
+            else if (result.DuplicateCommandAggregateRootIdList.Count > 0)
             {
                 Console.WriteLine("duplicated command execution.");
                 return;
@@ -116,11 +117,15 @@ namespace ENode.EventStorePerfTests
         static void InitializeENodeFramework()
         {
             var connectionString = ConfigurationManager.AppSettings["connectionString"];
+            var loggerFactory = new SerilogLoggerFactory()
+                .AddFileLogger("ECommon", "logs\\ecommon")
+                .AddFileLogger("EQueue", "logs\\equeue")
+                .AddFileLogger("ENode", "logs\\enode");
             _configuration = ECommonConfiguration
                 .Create()
                 .UseAutofac()
                 .RegisterCommonComponents()
-                .UseLog4Net()
+                .UseSerilog(loggerFactory)
                 .UseJsonNet()
                 .RegisterUnhandledExceptionHandler()
                 .CreateENode()

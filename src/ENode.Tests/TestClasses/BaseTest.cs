@@ -1,8 +1,10 @@
 ﻿using System.Configuration;
 using System.Reflection;
+using System.Threading;
 using ECommon.Components;
 using ECommon.Configurations;
 using ECommon.Logging;
+using ECommon.Serilog;
 using ENode.Commanding;
 using ENode.Configurations;
 using ENode.Domain;
@@ -17,6 +19,7 @@ namespace ENode.Tests
     public abstract class BaseTest
     {
         private ENodeConfiguration _enodeConfiguration;
+        private static SerilogLoggerFactory _serilogLoggerFactory;
         protected ILogger _logger;
         protected ICommandService _commandService;
         protected IMemoryCache _memoryCache;
@@ -57,6 +60,7 @@ namespace ENode.Tests
             if (_enodeConfiguration != null)
             {
                 CleanupEnode();
+                Thread.Sleep(3000);
             }
         }
 
@@ -72,15 +76,25 @@ namespace ENode.Tests
             {
                 Assembly.GetExecutingAssembly()
             };
-
+            if (_serilogLoggerFactory == null)
+            {
+                _serilogLoggerFactory = new SerilogLoggerFactory(defaultLoggerFileName: "logs\\default")
+                    .AddFileLogger("ECommon", "logs\\ecommon")
+                    .AddFileLogger("EQueue", "logs\\equeue")
+                    .AddFileLogger("ENode", "logs\\enode");
+            }
+            var configurationSetting = new ConfigurationSetting
+            {
+                ProcessProblemAggregateIntervalMilliseconds = 1000
+            };
             _enodeConfiguration = ECommonConfiguration
                 .Create()
                 .UseAutofac()
                 .RegisterCommonComponents()
-                .UseLog4Net()
+                .UseSerilog(_serilogLoggerFactory)
                 .UseJsonNet()
                 .RegisterUnhandledExceptionHandler()
-                .CreateENode()
+                .CreateENode(configurationSetting)
                 .RegisterENodeComponents()
                 .UseEventStore(useMockEventStore)
                 .UsePublishedVersionStore(useMockPublishedVersionStore)

@@ -15,15 +15,20 @@ namespace ENode.Commanding
         private readonly object _lockObj = new object();
         private readonly AsyncLock _asyncLock = new AsyncLock();
         private readonly ConcurrentDictionary<long, ProcessingCommand> _messageDict;
+        private readonly ConcurrentDictionary<string, Byte> _duplicateCommandIdDict;
         private readonly IProcessingCommandHandler _messageHandler;
         private readonly int _batchSize;
         private readonly ILogger _logger;
+        private volatile int _isUsing;
+        private volatile int _isRemoved;
+        private long _nextSequence;
 
         #endregion
 
         public ProcessingCommandMailbox(string aggregateRootId, IProcessingCommandHandler messageHandler, ILogger logger)
         {
             _messageDict = new ConcurrentDictionary<long, ProcessingCommand>();
+            _duplicateCommandIdDict = new ConcurrentDictionary<string, byte>();
             _messageHandler = messageHandler;
             _logger = logger;
             _batchSize = ENodeConfiguration.Instance.Setting.CommandMailBoxProcessBatchSize;
@@ -33,23 +38,24 @@ namespace ENode.Commanding
 
         public string AggregateRootId { get; private set; }
         public DateTime LastActiveTime { get; private set; }
+        public bool IsUsing { get { return _isUsing == 1; } }
+        public bool IsRemoved { get { return _isRemoved == 1; } }
         public bool IsRunning { get; private set; }
         public bool IsPauseRequested { get; private set; }
         public bool IsPaused { get; private set; }
-        public long NextSequence { get; private set; }
         public long ConsumingSequence { get; private set; }
         public long TotalUnHandledMessageCount
         {
             get
             {
-                return NextSequence - ConsumingSequence;
+                return _nextSequence - ConsumingSequence;
             }
         }
         public long MaxMessageSequence
         {
             get
             {
-                return NextSequence - 1;
+                return _nextSequence - 1;
             }
         }
 
@@ -57,14 +63,18 @@ namespace ENode.Commanding
         {
             lock (_lockObj)
             {
-                message.Sequence = NextSequence;
+                message.Sequence = _nextSequence;
                 message.MailBox = this;
                 if (_messageDict.TryAdd(message.Sequence, message))
                 {
-                    NextSequence++;
-                    _logger.DebugFormat("{0} enqueued new message, aggregateRootId: {1}, messageId: {2}, messageSequence: {3}", GetType().Name, AggregateRootId, message.Message.Id, message.Sequence);
+                    _nextSequence++;
+                    _logger.DebugFormat("{0} enqueued new command, aggregateRootId: {1}, messageId: {2}, messageSequence: {3}", GetType().Name, AggregateRootId, message.Message.Id, message.Sequence);
                     LastActiveTime = DateTime.Now;
                     TryRun();
+                }
+                else
+                {
+                    _logger.ErrorFormat("{0} enqueue command failed, aggregateRootId: {1}, messageId: {2}, messageSequence: {3}", GetType().Name, AggregateRootId, message.Message.Id, message.Sequence);
                 }
             }
         }
@@ -121,12 +131,9 @@ namespace ENode.Commanding
             LastActiveTime = DateTime.Now;
             _logger.DebugFormat("{0} reset consumingSequence, aggregateRootId: {1}, consumingSequence: {2}", GetType().Name, AggregateRootId, consumingSequence);
         }
-        public void Clear()
+        public void AddDuplicateCommandId(string commandId)
         {
-            _messageDict.Clear();
-            NextSequence = 0;
-            ConsumingSequence = 0;
-            LastActiveTime = DateTime.Now;
+            _duplicateCommandIdDict.TryAdd(commandId, 1);
         }
         public async Task CompleteMessage(ProcessingCommand message, CommandResult result)
         {
@@ -134,6 +141,7 @@ namespace ENode.Commanding
             {
                 if (_messageDict.TryRemove(message.Sequence, out ProcessingCommand removed))
                 {
+                    _duplicateCommandIdDict.TryRemove(message.Message.Id, out byte data);
                     LastActiveTime = DateTime.Now;
                     await message.CompleteAsync(result).ConfigureAwait(false);
                 }
@@ -146,6 +154,18 @@ namespace ENode.Commanding
         public bool IsInactive(int timeoutSeconds)
         {
             return (DateTime.Now - LastActiveTime).TotalSeconds >= timeoutSeconds;
+        }
+        public bool TryUsing()
+        {
+            return Interlocked.CompareExchange(ref _isUsing, 1, 0) == 0;
+        }
+        public void ExitUsing()
+        {
+            Interlocked.Exchange(ref _isUsing, 0);
+        }
+        public void MarkAsRemoved()
+        {
+            Interlocked.Exchange(ref _isRemoved, 1);
         }
 
         private async Task ProcessMessages()
@@ -161,6 +181,10 @@ namespace ENode.Commanding
                         var message = GetMessage(ConsumingSequence);
                         if (message != null)
                         {
+                            if (_duplicateCommandIdDict.ContainsKey(message.Message.Id))
+                            {
+                                message.IsDuplicated = true;
+                            }
                             await _messageHandler.HandleAsync(message).ConfigureAwait(false);
                         }
                         scannedCount++;

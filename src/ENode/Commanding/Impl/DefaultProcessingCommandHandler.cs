@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using ECommon.Extensions;
 using ECommon.IO;
 using ECommon.Logging;
 using ECommon.Serializing;
@@ -107,10 +108,19 @@ namespace ENode.Commanding.Impl
 
             commandContext.Clear();
 
+            if (processingCommand.IsDuplicated)
+            {
+                return RepublishCommandEvents(processingCommand, 0, new TaskCompletionSource<bool>());
+            }
+
             _ioHelper.TryAsyncActionRecursivelyWithoutResult("HandleCommandAsync",
             async () =>
             {
                 await commandHandler.HandleAsync(commandContext, command).ConfigureAwait(false);
+            },
+            currentRetryTimes => HandleCommandInternal(processingCommand, commandHandler, currentRetryTimes, taskSource),
+            async () =>
+            {
                 if (_logger.IsDebugEnabled)
                 {
                     _logger.DebugFormat("Handle command success. handlerType:{0}, commandType:{1}, commandId:{2}, aggregateRootId:{3}",
@@ -119,10 +129,6 @@ namespace ENode.Commanding.Impl
                         command.Id,
                         command.AggregateRootId);
                 }
-            },
-            currentRetryTimes => HandleCommandInternal(processingCommand, commandHandler, currentRetryTimes, taskSource),
-            async () =>
-            {
                 if (commandContext.GetApplicationMessage() != null)
                 {
                     await CommitChangesAsync(processingCommand, true, commandContext.GetApplicationMessage(), null, new TaskCompletionSource<bool>()).ConfigureAwait(false);
@@ -195,7 +201,7 @@ namespace ENode.Commanding.Impl
             //否则，如果我们直接将当前command设置为完成，即对MQ进行ack操作，那该command的事件就永远不会再发布到MQ了，这样就无法保证CQRS数据的最终一致性了。
             if (dirtyAggregateRootCount == 0 || changedEvents == null || changedEvents.Count() == 0)
             {
-                await ProcessIfNoEventsOfCommand(processingCommand, 0, new TaskCompletionSource<bool>()).ConfigureAwait(false);
+                await RepublishCommandEvents(processingCommand, 0, new TaskCompletionSource<bool>()).ConfigureAwait(false);
                 return;
             }
 
@@ -222,16 +228,16 @@ namespace ENode.Commanding.Impl
             //异步将事件流提交到EventStore
             _eventCommittingService.CommitDomainEventAsync(new EventCommittingContext(dirtyAggregateRoot, eventStream, processingCommand));
         }
-        private Task ProcessIfNoEventsOfCommand(ProcessingCommand processingCommand, int retryTimes, TaskCompletionSource<bool> taskSource)
+        private Task RepublishCommandEvents(ProcessingCommand processingCommand, int retryTimes, TaskCompletionSource<bool> taskSource)
         {
             var command = processingCommand.Message;
 
             _ioHelper.TryAsyncActionRecursively("ProcessIfNoEventsOfCommand",
             () => _eventStore.FindAsync(command.AggregateRootId, command.Id),
-            currentRetryTimes => ProcessIfNoEventsOfCommand(processingCommand, currentRetryTimes, taskSource),
+            currentRetryTimes => RepublishCommandEvents(processingCommand, currentRetryTimes, taskSource),
             async result =>
             {
-                var existingEventStream = result.Data;
+                var existingEventStream = result;
                 if (existingEventStream != null)
                 {
                     _eventCommittingService.PublishDomainEventAsync(processingCommand, existingEventStream);
@@ -258,7 +264,7 @@ namespace ENode.Commanding.Impl
             currentRetryTimes => HandleExceptionAsync(processingCommand, commandHandler, exception, errorMessage, currentRetryTimes, taskSource),
             async result =>
             {
-                var existingEventStream = result.Data;
+                var existingEventStream = result;
                 if (existingEventStream != null)
                 {
                     //这里，我们需要再重新做一遍发布事件这个操作；
@@ -272,15 +278,15 @@ namespace ENode.Commanding.Impl
                     //到这里，说明当前command执行遇到异常，然后当前command之前也没执行过，是第一次被执行。
                     //那就判断当前异常是否是需要被发布出去的异常，如果是，则发布该异常给所有消费者；
                     //否则，就记录错误日志，然后认为该command处理失败即可；
-                    var domainException = TryGetDomainException(exception);
-                    if (domainException != null)
+                    var realException = GetRealException(exception);
+                    if (realException is IDomainException)
                     {
-                        await PublishExceptionAsync(processingCommand, domainException, 0, new TaskCompletionSource<bool>()).ConfigureAwait(false);
+                        await PublishExceptionAsync(processingCommand, realException as IDomainException, 0, new TaskCompletionSource<bool>()).ConfigureAwait(false);
                         taskSource.SetResult(true);
                     }
                     else
                     {
-                        await CompleteCommand(processingCommand, CommandStatus.Failed, exception.GetType().Name, exception != null ? exception.Message : errorMessage).ConfigureAwait(false);
+                        await CompleteCommand(processingCommand, CommandStatus.Failed, realException.GetType().Name, exception != null ? realException.Message : errorMessage).ConfigureAwait(false);
                         taskSource.SetResult(true);
                     }
                 }
@@ -291,32 +297,22 @@ namespace ENode.Commanding.Impl
 
             return taskSource.Task;
         }
-        private IDomainException TryGetDomainException(Exception exception)
+        private Exception GetRealException(Exception exception)
         {
-            if (exception == null)
+            if (exception is AggregateException && ((AggregateException)exception).InnerExceptions.IsNotEmpty())
             {
-                return null;
+                return ((AggregateException)exception).InnerExceptions.First();
             }
-            else if (exception is IDomainException)
-            {
-                return exception as IDomainException;
-            }
-            else if (exception is AggregateException)
-            {
-                var aggregateException = exception as AggregateException;
-                var domainException = aggregateException.InnerExceptions.FirstOrDefault(x => x is IDomainException) as IDomainException;
-                return domainException;
-            }
-            return null;
+            return exception;
         }
         private Task PublishExceptionAsync(ProcessingCommand processingCommand, IDomainException exception, int retryTimes, TaskCompletionSource<bool> taskSource)
         {
             exception.MergeItems(processingCommand.Message.Items);
 
-            _ioHelper.TryAsyncActionRecursively("PublishExceptionAsync",
+            _ioHelper.TryAsyncActionRecursivelyWithoutResult("PublishExceptionAsync",
             () => _exceptionPublisher.PublishAsync(exception),
             currentRetryTimes => PublishExceptionAsync(processingCommand, exception, currentRetryTimes, taskSource),
-            async result =>
+            async () =>
             {
                 await CompleteCommand(processingCommand, CommandStatus.Failed, exception.GetType().Name, (exception as Exception).Message).ConfigureAwait(false);
                 taskSource.SetResult(true);
@@ -359,10 +355,10 @@ namespace ENode.Commanding.Impl
         {
             var command = processingCommand.Message;
 
-            _ioHelper.TryAsyncActionRecursively("PublishApplicationMessageAsync",
+            _ioHelper.TryAsyncActionRecursivelyWithoutResult("PublishApplicationMessageAsync",
             () => _applicationMessagePublisher.PublishAsync(message),
             currentRetryTimes => PublishMessageAsync(processingCommand, message, currentRetryTimes, taskSource),
-            async result =>
+            async () =>
             {
                 await CompleteCommand(processingCommand, CommandStatus.Success, message.GetType().FullName, _jsonSerializer.Serialize(message)).ConfigureAwait(false);
                 taskSource.SetResult(true);

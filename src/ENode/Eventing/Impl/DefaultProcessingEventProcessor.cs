@@ -1,11 +1,11 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 using ECommon.IO;
 using ECommon.Logging;
 using ECommon.Scheduling;
 using ENode.Configurations;
-using ENode.Infrastructure;
 using ENode.Messaging;
 
 namespace ENode.Eventing.Impl
@@ -20,22 +20,29 @@ namespace ENode.Eventing.Impl
         private readonly ILogger _logger;
         private readonly IScheduleService _scheduleService;
         private readonly int _timeoutSeconds;
-        private readonly string _taskName;
-        private readonly string _processorName;
+        private readonly string _scanInactiveMailBoxTaskName;
+        private readonly string _processProblemAggregateTaskName;
         private readonly int _scanExpiredAggregateIntervalMilliseconds;
+        private readonly int _processProblemAggregateIntervalMilliseconds;
+        private readonly ConcurrentDictionary<string, ProcessingEventMailBox> _problemAggregateRootMailBoxDict;
+
+        public string Name { get; }
 
         public DefaultProcessingEventProcessor(IPublishedVersionStore publishedVersionStore, IMessageDispatcher dispatcher, IOHelper ioHelper, ILoggerFactory loggerFactory, IScheduleService scheduleService)
         {
             _mailboxDict = new ConcurrentDictionary<string, ProcessingEventMailBox>();
+            _problemAggregateRootMailBoxDict = new ConcurrentDictionary<string, ProcessingEventMailBox>();
             _publishedVersionStore = publishedVersionStore;
             _dispatcher = dispatcher;
             _ioHelper = ioHelper;
             _logger = loggerFactory.Create(GetType().FullName);
             _scheduleService = scheduleService;
-            _taskName = "CleanInactiveProcessingEventMailBoxes_" + DateTime.Now.Ticks + new Random().Next(10000);
+            _scanInactiveMailBoxTaskName = "CleanInactiveProcessingEventMailBoxes_" + DateTime.Now.Ticks + new Random().Next(10000);
+            _processProblemAggregateTaskName = "ProcessProblemAggregate_" + DateTime.Now.Ticks + new Random().Next(10000);
             _timeoutSeconds = ENodeConfiguration.Instance.Setting.AggregateRootMaxInactiveSeconds;
-            _processorName = ENodeConfiguration.Instance.Setting.DomainEventProcessorName;
+            Name = ENodeConfiguration.Instance.Setting.DomainEventProcessorName;
             _scanExpiredAggregateIntervalMilliseconds = ENodeConfiguration.Instance.Setting.ScanExpiredAggregateIntervalMilliseconds;
+            _processProblemAggregateIntervalMilliseconds = ENodeConfiguration.Instance.Setting.ProcessProblemAggregateIntervalMilliseconds;
         }
 
         public void Process(ProcessingEvent processingMessage)
@@ -45,70 +52,120 @@ namespace ENode.Eventing.Impl
             {
                 throw new ArgumentException("aggregateRootId of domain event stream cannot be null or empty, domainEventStreamId:" + processingMessage.Message.Id);
             }
-
-            lock (_lockObj)
+            var mailbox = _mailboxDict.GetOrAdd(aggregateRootId, x => BuildProcessingEventMailBox(processingMessage));
+            var mailboxTryUsingCount = 0L;
+            while (!mailbox.TryUsing())
             {
-                var mailbox = _mailboxDict.GetOrAdd(aggregateRootId, x =>
+                Thread.Sleep(1);
+                mailboxTryUsingCount++;
+                if (mailboxTryUsingCount % 10000 == 0)
                 {
-                    var latestHandledEventVersion = GetAggregateRootLatestHandledEventVersion(processingMessage.Message.AggregateRootTypeName, aggregateRootId);
-                    return new ProcessingEventMailBox(aggregateRootId, latestHandledEventVersion, y => DispatchProcessingMessageAsync(y, 0), _logger);
-                });
-                mailbox.EnqueueMessage(processingMessage);
+                    _logger.WarnFormat("Event mailbox try using count: {0}, aggregateRootId: {1}, aggregateRootTypeName: {2}", mailboxTryUsingCount, mailbox.AggregateRootId, mailbox.AggregateRootTypeName);
+                }
             }
+            if (mailbox.IsRemoved)
+            {
+                mailbox = BuildProcessingEventMailBox(processingMessage);
+                _mailboxDict.TryAdd(aggregateRootId, mailbox);
+            }
+            ProcessingEventMailBox.EnqueueMessageResult enqueueResult = mailbox.EnqueueMessage(processingMessage);
+            if (enqueueResult == ProcessingEventMailBox.EnqueueMessageResult.Ignored)
+            {
+                processingMessage.ProcessContext.NotifyEventProcessed();
+            }
+            else if (enqueueResult == ProcessingEventMailBox.EnqueueMessageResult.AddToWaitingList)
+            {
+                AddProblemAggregateMailBoxToDict(mailbox);
+            }
+            mailbox.ExitUsing();
         }
         public void Start()
         {
-            _scheduleService.StartTask(_taskName, CleanInactiveMailbox, _scanExpiredAggregateIntervalMilliseconds, _scanExpiredAggregateIntervalMilliseconds);
+            _scheduleService.StartTask(_scanInactiveMailBoxTaskName, CleanInactiveMailbox, _scanExpiredAggregateIntervalMilliseconds, _scanExpiredAggregateIntervalMilliseconds);
+            _scheduleService.StartTask(_processProblemAggregateTaskName, ProcessProblemAggregates, _processProblemAggregateIntervalMilliseconds, _processProblemAggregateIntervalMilliseconds);
         }
         public void Stop()
         {
-            _scheduleService.StopTask(_taskName);
+            _scheduleService.StopTask(_scanInactiveMailBoxTaskName);
         }
 
-        private void DispatchProcessingMessageAsync(ProcessingEvent processingMessage, int retryTimes)
+        private ProcessingEventMailBox BuildProcessingEventMailBox(ProcessingEvent processingMessage)
         {
-            _ioHelper.TryAsyncActionRecursively("DispatchProcessingMessageAsync",
-            () => _dispatcher.DispatchMessagesAsync(processingMessage.Message.Events),
-            currentRetryTimes => DispatchProcessingMessageAsync(processingMessage, currentRetryTimes),
-            result =>
-            {
-                UpdatePublishedVersionAsync(processingMessage, 0);
-            },
-            () => string.Format("sequence message [messageId:{0}, messageType:{1}, aggregateRootId:{2}, aggregateRootVersion:{3}]", processingMessage.Message.Id, processingMessage.Message.GetType().Name, processingMessage.Message.AggregateRootId, processingMessage.Message.Version),
-            null,
-            retryTimes, true);
+            var latestHandledEventVersion = GetAggregateRootLatestHandledEventVersion(processingMessage.Message.AggregateRootTypeName, processingMessage.Message.AggregateRootId);
+            return new ProcessingEventMailBox(processingMessage.Message.AggregateRootTypeName, processingMessage.Message.AggregateRootId, latestHandledEventVersion + 1, y => DispatchProcessingMessageAsync(y, 0), _logger);
         }
-        private int GetAggregateRootLatestHandledEventVersion(string aggregateRootType, string aggregateRootId)
+        private void AddProblemAggregateMailBoxToDict(ProcessingEventMailBox mailbox)
         {
-            try
+            if (_problemAggregateRootMailBoxDict.TryAdd(mailbox.AggregateRootId, mailbox))
             {
-                var task = _publishedVersionStore.GetPublishedVersionAsync(_processorName, aggregateRootType, aggregateRootId);
-                task.Wait();
-                if (task.Exception != null)
+                _logger.WarnFormat("Added problem aggregate mailbox, aggregateRootTypeName: {0}, aggregateRootId: {1}", mailbox.AggregateRootTypeName, mailbox.AggregateRootId);
+            }
+        }
+        private void ProcessProblemAggregates()
+        {
+            var entryList = _problemAggregateRootMailBoxDict.ToArray();
+            if (entryList.Length == 0)
+            {
+                return;
+            }
+            var problemMailboxList = new List<ProcessingEventMailBox>();
+            var recoveredMailboxList = new List<ProcessingEventMailBox>();
+            foreach (var entry in entryList)
+            {
+                var aggregateRootMailBox = entry.Value;
+                if (aggregateRootMailBox.WaitingMessageCount > 0)
                 {
-                    throw task.Exception;
-                }
-                else if (task.Result.Status == AsyncTaskStatus.Success)
-                {
-                    return task.Result.Data;
+                    problemMailboxList.Add(aggregateRootMailBox);
                 }
                 else
                 {
-                    throw new Exception("_publishedVersionStore.GetPublishedVersionAsync has unknown exception, errorMessage: " + task.Result.ErrorMessage);
+                    recoveredMailboxList.Add(aggregateRootMailBox);
                 }
+            }
+            foreach (var mailbox in problemMailboxList)
+            {
+                var latestHandledEventVersion = GetAggregateRootLatestHandledEventVersion(mailbox.AggregateRootTypeName, mailbox.AggregateRootId);
+                mailbox.SetNextExpectingEventVersion(latestHandledEventVersion + 1);
+            }
+            foreach (var mailbox in recoveredMailboxList)
+            {
+                if (_problemAggregateRootMailBoxDict.TryRemove(mailbox.AggregateRootId, out ProcessingEventMailBox removed))
+                {
+                    _logger.InfoFormat("Removed problem aggregate mailbox, aggregateRootTypeName: {0}, aggregateRootId: {1}", removed.AggregateRootTypeName, removed.AggregateRootId);
+                }
+            }
+        }
+        private void DispatchProcessingMessageAsync(ProcessingEvent processingMessage, int retryTimes)
+        {
+            _ioHelper.TryAsyncActionRecursivelyWithoutResult("DispatchProcessingMessageAsync",
+            () => _dispatcher.DispatchMessagesAsync(processingMessage.Message.Events),
+            currentRetryTimes => DispatchProcessingMessageAsync(processingMessage, currentRetryTimes),
+            () =>
+            {
+                UpdatePublishedVersionAsync(processingMessage, 0);
+            },
+            () => string.Format("Message[messageId:{0}, messageType:{1}, aggregateRootId:{2}, aggregateRootVersion:{3}]", processingMessage.Message.Id, processingMessage.Message.GetType().Name, processingMessage.Message.AggregateRootId, processingMessage.Message.Version),
+            null,
+            retryTimes, true);
+        }
+        private int GetAggregateRootLatestHandledEventVersion(string aggregateRootTypeName, string aggregateRootId)
+        {
+            try
+            {
+                return _publishedVersionStore.GetPublishedVersionAsync(Name, aggregateRootTypeName, aggregateRootId).Result;
             }
             catch (Exception ex)
             {
-                throw new Exception("_publishedVersionStore.GetPublishedVersionAsync has unknown exception.", ex);
+                throw new Exception(string.Format("_publishedVersionStore.GetPublishedVersionAsync has unknown exception, aggregateRootTypeName: {0}, aggregateRootId: {1}", aggregateRootTypeName, aggregateRootId), ex);
             }
         }
         private void UpdatePublishedVersionAsync(ProcessingEvent processingMessage, int retryTimes)
         {
             var message = processingMessage.Message;
-            _ioHelper.TryAsyncActionRecursively("UpdatePublishedVersionAsync",
-            () => _publishedVersionStore.UpdatePublishedVersionAsync(_processorName, message.AggregateRootTypeName, message.AggregateRootId, message.Version),
+            _ioHelper.TryAsyncActionRecursivelyWithoutResult("UpdatePublishedVersionAsync",
+            () => _publishedVersionStore.UpdatePublishedVersionAsync(Name, message.AggregateRootTypeName, message.AggregateRootId, message.Version),
             currentRetryTimes => UpdatePublishedVersionAsync(processingMessage, currentRetryTimes),
-            result =>
+            () =>
             {
                 processingMessage.Complete();
             },
@@ -121,24 +178,31 @@ namespace ENode.Eventing.Impl
             var inactiveList = new List<KeyValuePair<string, ProcessingEventMailBox>>();
             foreach (var pair in _mailboxDict)
             {
-                if (pair.Value.IsInactive(_timeoutSeconds) && !pair.Value.IsRunning)
+                if (IsMailBoxAllowRemove(pair.Value))
                 {
                     inactiveList.Add(pair);
                 }
             }
             foreach (var pair in inactiveList)
             {
-                lock (_lockObj)
+                var mailbox = pair.Value;
+                if (mailbox.TryUsing())
                 {
-                    if (pair.Value.IsInactive(_timeoutSeconds) && !pair.Value.IsRunning && pair.Value.TotalUnHandledMessageCount == 0)
+                    if (IsMailBoxAllowRemove(mailbox))
                     {
                         if (_mailboxDict.TryRemove(pair.Key, out ProcessingEventMailBox removed))
                         {
-                            _logger.InfoFormat("Removed inactive domain event stream mailbox, aggregateRootId: {0}", pair.Key);
+                            removed.MarkAsRemoved();
+                            _logger.InfoFormat("Removed inactive domain event stream mailbox, aggregateRootTypeName: {0}, aggregateRootId: {1}", removed.AggregateRootTypeName, removed.AggregateRootId);
                         }
                     }
                 }
+                mailbox.ExitUsing();
             }
+        }
+        private bool IsMailBoxAllowRemove(ProcessingEventMailBox mailbox)
+        {
+            return mailbox.IsInactive(_timeoutSeconds) && !mailbox.IsRunning && mailbox.TotalUnHandledMessageCount == 0 && mailbox.WaitingMessageCount == 0;
         }
     }
 }
